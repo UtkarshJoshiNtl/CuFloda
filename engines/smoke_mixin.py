@@ -47,13 +47,17 @@ class SmokeMixin:
             self._advect_smoke_2d(xp)
 
     def _advect_smoke_2d(self, xp) -> None:
-        u_adv = xp.where(self.obstacles, 0.0, self.u)
-        v_adv = xp.where(self.obstacles, 0.0, self.v)
+        u_adv = xp.nan_to_num(
+            xp.where(self.obstacles, 0.0, self.u), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        v_adv = xp.nan_to_num(
+            xp.where(self.obstacles, 0.0, self.v), nan=0.0, posinf=0.0, neginf=0.0
+        )
 
         x_orig = self._x_coords[xp.newaxis, :] - u_adv
         y_orig = self._y_coords[:, xp.newaxis] - v_adv
-        x_orig = xp.clip(x_orig, 0, self.width - 1)
-        y_orig = xp.clip(y_orig, 0, self.height - 1)
+        x_orig = xp.clip(x_orig, 0, self.width - 1.0001)
+        y_orig = xp.clip(y_orig, 0, self.height - 1.0001)
 
         x0 = xp.floor(x_orig).astype(xp.int32)
         y0 = xp.floor(y_orig).astype(xp.int32)

@@ -435,9 +435,16 @@ class _PresetCard(QWidget):
             )
             thumb_label.setPixmap(pix)
         else:
-            thumb_label.setText("flow")
+            # Fallback: colored rectangle with preset icon
+            thumb_label.setStyleSheet(
+                "background: #1e293b; border: 1px solid #334155; border-radius: 6px;"
+            )
             thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb_label.setStyleSheet("font-size: 24px; color: #38bdf8;")
+            # Use first letter of preset name as icon
+            icon_text = preset.get("name", "?")[0].upper()
+            thumb_label.setText(
+                f"<span style='font-size: 32px; color: #64748b;'>{icon_text}</span>"
+            )
         thumb_label.setMinimumHeight(72)
         layout.addWidget(thumb_label)
 
