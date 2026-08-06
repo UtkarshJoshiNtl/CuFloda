@@ -19,6 +19,7 @@ from OpenGL.GL import (  # noqa: E402
     GL_FLOAT,
     GL_FRAGMENT_SHADER,
     GL_LINEAR,
+    GL_R8,
     GL_R16F,
     GL_RED,
     GL_RGB,
@@ -31,6 +32,7 @@ from OpenGL.GL import (  # noqa: E402
     GL_TEXTURE_WRAP_S,
     GL_TEXTURE_WRAP_T,
     GL_TRIANGLES,
+    GL_UNPACK_ALIGNMENT,
     GL_UNSIGNED_BYTE,
     GL_VERTEX_SHADER,
     glActiveTexture,
@@ -46,6 +48,7 @@ from OpenGL.GL import (  # noqa: E402
     glGenTextures,
     glGenVertexArrays,
     glGetUniformLocation,
+    glPixelStorei,
     glTexImage2D,
     glTexParameteri,
     glTexSubImage2D,
@@ -127,7 +130,6 @@ class Viewport(QOpenGLWidget):
         self._perf_mode = False
         self._tex_init = False
         self._cmap_tex: int | None = None
-        self._cmap_uploaded: str | None = None
         self._show_quiver = False
         self._show_streamlines = False
         self._show_contours = False
@@ -160,6 +162,7 @@ class Viewport(QOpenGLWidget):
 
     def set_scene(self, scene: Scene) -> None:
         self.scene = scene
+        self._tex_init = False
 
     def set_probes(self, probes: list[Probe]) -> None:
         self.probes = probes
@@ -169,7 +172,6 @@ class Viewport(QOpenGLWidget):
 
     def set_colormap(self, name: str) -> None:
         self._colormap = name
-        self._cmap_uploaded = None
         if self._cmap_tex is not None:
             self._upload_colormap()
 
@@ -313,6 +315,9 @@ class Viewport(QOpenGLWidget):
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        self._u_smoke = glGetUniformLocation(self.shader, "smokeTex")
+        self._u_cmap = glGetUniformLocation(self.shader, "cmapTex")
+        self._u_boost = glGetUniformLocation(self.shader, "uBoost")
         self._upload_colormap()
 
     def paintGL(self) -> None:
@@ -326,7 +331,7 @@ class Viewport(QOpenGLWidget):
         rect = self._canvas_rect()
         glViewport(
             int(rect.x() * dpr),
-            int(rect.y() * dpr),
+            int((self.height() - rect.y() - rect.height()) * dpr),
             int(rect.width() * dpr),
             int(rect.height() * dpr),
         )
@@ -335,11 +340,11 @@ class Viewport(QOpenGLWidget):
         glUseProgram(self.shader)
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, self.texture)
-        glUniform1i(glGetUniformLocation(self.shader, "smokeTex"), 0)
+        glUniform1i(self._u_smoke, 0)
         glActiveTexture(GL_TEXTURE1)
         glBindTexture(GL_TEXTURE_2D, self._cmap_tex)
-        glUniform1i(glGetUniformLocation(self.shader, "cmapTex"), 1)
-        glUniform1f(glGetUniformLocation(self.shader, "uBoost"), self._gamma)
+        glUniform1i(self._u_cmap, 1)
+        glUniform1f(self._u_boost, self._gamma)
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLES, 0, 6)
         glBindVertexArray(0)
@@ -366,16 +371,18 @@ class Viewport(QOpenGLWidget):
         field = self._field_to_2d(np.ascontiguousarray(field))
         h, w = field.shape
         if self._perf_mode:
-            field_u8 = (field * 255).astype(np.uint8)
-            fmt = GL_RGB
-            upload = field_u8
+            fmt = GL_RED
+            internal = GL_R8
+            pix_type = GL_UNSIGNED_BYTE
+            upload = (field * 255).astype(np.uint8)
         else:
             fmt = GL_RED
+            internal = GL_R16F
+            pix_type = GL_FLOAT
             upload = field
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
         glBindTexture(GL_TEXTURE_2D, self.texture)
         if not self._tex_init:
-            internal = GL_RGB if self._perf_mode else GL_R16F
-            pix_type = GL_UNSIGNED_BYTE if self._perf_mode else GL_FLOAT
             glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, fmt, pix_type, upload)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
@@ -383,7 +390,6 @@ class Viewport(QOpenGLWidget):
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
             self._tex_init = True
         else:
-            pix_type = GL_UNSIGNED_BYTE if self._perf_mode else GL_FLOAT
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, fmt, pix_type, upload)
 
     def _upload_colormap(self) -> None:
