@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -25,6 +28,7 @@ class _ProbePlot(QWidget):
     def __init__(self, probe: Probe, index: int, parent=None):
         super().__init__(parent)
         self.probe = probe
+        self._y_range = None  # Track stable y-range
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -51,8 +55,11 @@ class _ProbePlot(QWidget):
         self.plot.setMinimumHeight(120)
         self.plot.setMaximumHeight(200)
         self.plot.showGrid(True, True, 0.3)
-        self.plot.setLabel("left", probe.spec.fields[0] if probe.spec.fields else "")
+        self.plot.setLabel(
+            "left", probe.spec.fields[0] if probe.spec.fields else "", units=""
+        )
         self.plot.setLabel("bottom", "step")
+        self.plot.getAxis("left").setStyle(tickFont=QFont("Arial", 9))
         color = _COLORS[index % len(_COLORS)]
         self.curve = self.plot.plot(pen=color)
         layout.addWidget(self.plot)
@@ -63,7 +70,28 @@ class _ProbePlot(QWidget):
         if len(data) < 2:
             return
         self.curve.setData(data)
-        self.plot.setLabel("left", field)
+        self.plot.setLabel("left", field, units="")
+
+        # Stabilize y-axis range to prevent wild jumps
+        data_arr = np.array(data)
+        data_min, data_max = data_arr.min(), data_arr.max()
+        data_range = data_max - data_min
+
+        if self._y_range is None:
+            # Initialize with first data range + 10% padding
+            padding = max(0.1 * data_range, 1e-6)
+            self._y_range = (data_min - padding, data_max + padding)
+        else:
+            # Gradually expand range if needed, never shrink
+            current_min, current_max = self._y_range
+            new_min = min(current_min, data_min)
+            new_max = max(current_max, data_max)
+            # Only expand if data significantly exceeds current range
+            if data_min < current_min or data_max > current_max:
+                padding = max(0.1 * (new_max - new_min), 1e-6)
+                self._y_range = (new_min - padding, new_max + padding)
+
+        self.plot.setYRange(self._y_range[0], self._y_range[1])
 
 
 class AnalysisPanel(QWidget):
@@ -83,13 +111,38 @@ class AnalysisPanel(QWidget):
         self.physics_group = QGroupBox("Physics Readouts")
         pf = QFormLayout()
         self.re_label = QLabel("—")
+        self.re_label.setToolTip("Reynolds number: ratio of inertial to viscous forces")
         self.st_label = QLabel("—")
+        self.st_label.setToolTip(
+            "Strouhal number: vortex shedding frequency (requires periodic shedding)"
+        )
         self.cd_label = QLabel("—")
+        self.cd_label.setToolTip(
+            "Drag coefficient: flow resistance (may fluctuate while developing)"
+        )
         pf.addRow("Re", self.re_label)
         pf.addRow("St", self.st_label)
         pf.addRow("Cd", self.cd_label)
         self.physics_group.setLayout(pf)
         layout.addWidget(self.physics_group)
+
+        # --- Stability strip chart (live max |u|) ---
+        self.stability_group = QGroupBox("Stability (max |u|)")
+        st_layout = QVBoxLayout()
+        st_layout.setContentsMargins(4, 4, 4, 4)
+        self.stability_plot = pg.PlotWidget()
+        self.stability_plot.setMinimumHeight(56)
+        self.stability_plot.setMaximumHeight(72)
+        self.stability_plot.hideAxis("left")
+        self.stability_plot.hideAxis("bottom")
+        self.stability_plot.setMenuEnabled(False)
+        self.stability_plot.setMouseEnabled(False, False)
+        self.stability_plot.getViewBox().setDefaultPadding(0.0)
+        self.stability_curve = self.stability_plot.plot(pen="#3fb950")
+        self._stability_data: deque[float] = deque(maxlen=256)
+        st_layout.addWidget(self.stability_plot)
+        self.stability_group.setLayout(st_layout)
+        layout.addWidget(self.stability_group)
 
         # --- Probe plots (scrollable) ---
         self.probes_group = QGroupBox("Probe Plots")
@@ -109,10 +162,10 @@ class AnalysisPanel(QWidget):
         self._no_probes_label.setStyleSheet("color: #64748b; padding: 20px;")
         self._no_probes_label.setVisible(True)
 
-        pg = QVBoxLayout()
-        pg.addWidget(self._no_probes_label)
-        pg.addWidget(self.probes_scroll)
-        self.probes_group.setLayout(pg)
+        probes_outer = QVBoxLayout()
+        probes_outer.addWidget(self._no_probes_label)
+        probes_outer.addWidget(self.probes_scroll)
+        self.probes_group.setLayout(probes_outer)
         layout.addWidget(self.probes_group, 1)
 
         # --- Field statistics ---
@@ -153,6 +206,8 @@ class AnalysisPanel(QWidget):
     def tick(self, dt: float = 1.0) -> None:
         self._tick_counter += 1
 
+        self._record_stability()
+
         if self._tick_counter % 2 == 0:
             for probe in self.probes:
                 probe.record(self.sim)
@@ -164,6 +219,22 @@ class AnalysisPanel(QWidget):
         if self._tick_counter % 3 == 0:
             for pw in self._probe_widgets:
                 pw.update_plot()
+
+    def _record_stability(self) -> None:
+        try:
+            vel = self.sim.get_velocity()
+            max_u = float(np.sqrt(vel[:, :, 0] ** 2 + vel[:, :, 1] ** 2).max())
+        except Exception:
+            return
+        self._stability_data.append(max_u)
+        if self._tick_counter % 3 == 0 and len(self._stability_data) > 1:
+            data = list(self._stability_data)
+            self.stability_curve.setData(data)
+            lo = min(data)
+            hi = max(data)
+            pad = max((hi - lo) * 0.1, 1e-4)
+            self.stability_plot.setYRange(lo - pad, hi + pad, padding=0)
+            self.stability_plot.setXRange(0, self._stability_data.maxlen, padding=0)
 
     def set_scene(self, scene: Scene) -> None:
         self.scene = scene

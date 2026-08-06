@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSlider,
     QSplitter,
     QStatusBar,
     QToolBar,
@@ -47,6 +46,7 @@ from workbench.panels.scene_panel import ScenePanel
 from workbench.panels.sidebar import Sidebar, SidebarSection
 from workbench.viewport import Viewport
 from workbench.widgets.tool_strip import ToolStrip
+from workbench.widgets.transport_bar import TransportBar
 
 _COLORMAPS = [
     "speed",
@@ -78,6 +78,7 @@ class MainWindow(QMainWindow):
         self._demo_running = False
         self._expert_mode = False
         self._frame_start = 0.0
+        self._speed_factor = 1.0
         self._state_history: list[tuple[int, np.ndarray, np.ndarray]] = []
         self._max_history_steps = 300
         self._scrubbing = False
@@ -121,32 +122,30 @@ class MainWindow(QMainWindow):
         )
         self.tool_strip.tool_selected.connect(self._set_draw_mode)
         vp_layout.addWidget(self.tool_strip)
+
+        self.sanity_banner = QLabel("")
+        self.sanity_banner.setVisible(False)
+        vp_layout.addWidget(self.sanity_banner)
         vp_layout.addWidget(self.viewport, 1)
 
-        # --- Timeline Scrubbing Bar ---
-        timeline_bar = QHBoxLayout()
-        timeline_bar.setContentsMargins(8, 4, 8, 4)
-        lbl_timeline = QLabel("Timeline:")
-        lbl_timeline.setStyleSheet("color: #8b949e; font-weight: 600; font-size: 11px;")
-        timeline_bar.addWidget(lbl_timeline)
-
-        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
-        self.timeline_slider.setRange(0, 0)
-        self.timeline_slider.setValue(0)
-        self.timeline_slider.setToolTip("Scrub simulation timeline back and forth")
-        self.timeline_slider.sliderPressed.connect(self._on_timeline_pressed)
-        self.timeline_slider.sliderMoved.connect(self._on_timeline_moved)
-        self.timeline_slider.sliderReleased.connect(self._on_timeline_released)
-        timeline_bar.addWidget(self.timeline_slider, 1)
-
-        self.timeline_label = QLabel("Step 0")
-        self.timeline_label.setStyleSheet(
-            "color: #58a6ff; font-family: 'JetBrains Mono', monospace; font-size: 11px;"
-        )
-        timeline_bar.addWidget(self.timeline_label)
-        vp_layout.addLayout(timeline_bar)
-
         right_layout.addWidget(vp_frame, 1)
+
+        # --- Bottom Transport Bar (full width) ---
+        self.transport_bar = TransportBar()
+        self.transport_bar.play_toggled.connect(lambda _: self.toggle_pause())
+        self.transport_bar.step_requested.connect(self.step_once)
+        self.transport_bar.reset_requested.connect(self.reset)
+        self.transport_bar.speed_changed.connect(self._on_speed_changed)
+        self.transport_bar.timeline_slider.sliderPressed.connect(
+            self._on_timeline_pressed
+        )
+        self.transport_bar.timeline_slider.sliderMoved.connect(self._on_timeline_moved)
+        self.transport_bar.timeline_slider.sliderReleased.connect(
+            self._on_timeline_released
+        )
+        self.timeline_slider = self.transport_bar.timeline_slider
+        self.timeline_label = self.transport_bar.step_label
+        right_layout.addWidget(self.transport_bar)
 
         # Create panels before adding to left sidebar
         self.runtime_probes: list[Probe] = []
@@ -218,38 +217,11 @@ class MainWindow(QMainWindow):
         self.timer.start(33)
 
         self._update_re_label()
+        self._update_sanity_banner()
 
     def _setup_toolbar(self) -> None:
         self.toolbar = QToolBar("Simulation")
         self.addToolBar(self.toolbar)
-
-        # --- Core simulation controls ---
-        self.play_btn = QPushButton("Pause")
-        self.play_btn.setFixedWidth(80)
-        self.play_btn.setToolTip(
-            "Pause or resume the simulation\n"
-            "Why: Control timing to observe specific flow events"
-        )
-        self.play_btn.clicked.connect(self.toggle_pause)
-        self.toolbar.addWidget(self.play_btn)
-
-        step_btn = QPushButton("Step")
-        step_btn.setToolTip(
-            "Advance one frame\nWhy: Slow down to see exactly how fluid moves"
-            " step-by-step"
-        )
-        step_btn.clicked.connect(self.step_once)
-        self.toolbar.addWidget(step_btn)
-
-        reset_btn = QPushButton("Reset")
-        reset_btn.setToolTip(
-            "Clear simulation and restart from initial conditions\n"
-            "Why: Start fresh after changing parameters"
-        )
-        reset_btn.clicked.connect(self.reset)
-        self.toolbar.addWidget(reset_btn)
-
-        self.toolbar.addSeparator()
 
         # --- Scene management ---
         self.start_btn = QPushButton("Start…")
@@ -556,6 +528,7 @@ class MainWindow(QMainWindow):
         self._demo_target = self.scene.product.autorun_steps
         self.outcome_panel.set_demo_target(self._demo_target)
         self._update_title()
+        self._update_sanity_banner()
         self._update_re_label()
         self._focus_outcome()
 
@@ -613,7 +586,7 @@ class MainWindow(QMainWindow):
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
-        self.play_btn.setText("Play" if self.paused else "Pause")
+        self.transport_bar.set_play_state(not self.paused)
 
     def _record_state_history(self) -> None:
         if self._scrubbing:
@@ -632,7 +605,7 @@ class MainWindow(QMainWindow):
     def _on_timeline_pressed(self) -> None:
         self._scrubbing = True
         self.paused = True
-        self.play_btn.setText("Play")
+        self.transport_bar.set_play_state(False)
 
     def _on_timeline_moved(self, index: int) -> None:
         if 0 <= index < len(self._state_history):
@@ -672,9 +645,10 @@ class MainWindow(QMainWindow):
         self.step_count = 0
         self._state_history.clear()
         self.timeline_slider.setRange(0, 0)
-        self.timeline_label.setText("0 / 0")
+        self.timeline_label.setText("Step 0")
         self.outcome_panel.update_outcome(self.step_count, force=True)
         self._update_re_label()
+        self._update_sanity_banner()
 
     def tick(self) -> None:
         if not self.paused and not self._scrubbing:
@@ -686,7 +660,7 @@ class MainWindow(QMainWindow):
                 if self.step_count >= self._demo_target:
                     self._demo_running = False
                     self.paused = True
-                    self.play_btn.setText("Play")
+                    self.transport_bar.set_play_state(False)
                     self.demo_btn.setText("Run Demo")
         self.outcome_panel.update_outcome(self.step_count)
         self.viewport.update()
@@ -696,10 +670,48 @@ class MainWindow(QMainWindow):
         self._fps_count += 1
         fps_str = f"{self._fps_value:.0f}"
         self.status_label.setText(f"Step {self.step_count}  |  FPS: {fps_str}")
+        self.transport_bar.set_fps(self._fps_value)
         self._update_re_label()
         elapsed = time.perf_counter() - self._frame_start
-        self.timer.start(max(1, 33 - int(elapsed * 1000)))
+        interval = int(33 / self._speed_factor) - int(elapsed * 1000)
+        self.timer.start(max(1, interval))
         self._frame_start = time.perf_counter()
+
+    def _on_speed_changed(self, factor: float) -> None:
+        self._speed_factor = factor
+
+    def _update_sanity_banner(self) -> None:
+        if not hasattr(self, "sanity_banner"):
+            return
+        warnings = check_sanity(
+            self.sim,
+            self.scene,
+            probes=self.runtime_probes,
+            step_count=self.step_count,
+        )
+        if not warnings:
+            text = "Setup looks stable"
+            color = "#3fb950"
+        else:
+            danger = [w for w in warnings if w.level == "danger"]
+            warn = [w for w in warnings if w.level == "warn"]
+            if danger:
+                color = "#f85149"
+                text = "Critical: " + "; ".join(w.title for w in danger)
+            elif warn:
+                color = "#d29922"
+                text = "Caution: " + "; ".join(w.title for w in warn)
+            else:
+                color = "#8b949e"
+                text = "Notes: " + "; ".join(w.title for w in warnings)
+        self.sanity_banner.setText(text)
+        self.sanity_banner.setToolTip("\n".join(w.message for w in warnings))
+        self.sanity_banner.setVisible(True)
+        self.sanity_banner.setStyleSheet(
+            f"QLabel {{ background: #161b22; color: {color}; "
+            "border-bottom: 1px solid #30363d; "
+            "padding: 4px 12px; font-size: 11px; font-weight: 600; }"
+        )
 
     def _set_draw_mode(self, mode: str | None) -> None:
         self.tool_strip.set_mode(mode)
@@ -890,7 +902,7 @@ class MainWindow(QMainWindow):
         self._demo_target = target
         self._demo_running = True
         self.paused = False
-        self.play_btn.setText("Pause")
+        self.transport_bar.set_play_state(True)
         self.demo_btn.setText("Running...")
         self.outcome_panel.set_demo_target(target)
         self._set_colormap(self.scene.product.recommended_colormap or "vorticity")
