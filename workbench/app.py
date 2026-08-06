@@ -3,21 +3,25 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
-    QDockWidget,
     QFileDialog,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPushButton,
+    QSlider,
+    QSplitter,
     QStatusBar,
     QToolBar,
     QVBoxLayout,
+    QWidget,
 )
 
 from analysis.regimes import detect_flow_regime
@@ -29,6 +33,7 @@ from export.image import export_image
 from export.report import export_markdown_report
 from export.video import VideoRecorder
 from presets.loader import list_presets, load_preset
+from resources.theme import APP_STYLESHEET
 from scene.probe import Probe
 from scene.scene import ProbeSpec, Scene, apply_to_sim, default_scene
 from scene.serializer import load as scene_load
@@ -39,7 +44,9 @@ from workbench.dialogs.wizard_dialog import StartDialog, WizardTemplate
 from workbench.panels.analysis_panel import AnalysisPanel
 from workbench.panels.outcome_panel import OutcomePanel
 from workbench.panels.scene_panel import ScenePanel
+from workbench.panels.sidebar import Sidebar, SidebarSection
 from workbench.viewport import Viewport
+from workbench.widgets.tool_strip import ToolStrip
 
 _COLORMAPS = [
     "speed",
@@ -71,9 +78,13 @@ class MainWindow(QMainWindow):
         self._demo_running = False
         self._expert_mode = False
         self._frame_start = 0.0
+        self._state_history: list[tuple[int, np.ndarray, np.ndarray]] = []
+        self._max_history_steps = 300
+        self._scrubbing = False
 
         self.setWindowTitle("S-Stream - Fluid Workbench")
         self.resize(1320, 840)
+        self.setStyleSheet(APP_STYLESHEET)
 
         self._configure_domain_for_scene()
         apply_to_sim(self.scene, self.sim)
@@ -83,49 +94,115 @@ class MainWindow(QMainWindow):
         self.viewport.set_scene(self.scene)
         self.viewport.obstacle_created.connect(self._on_viewport_obstacle)
         self.viewport.probe_placed.connect(self._on_viewport_probe)
+
+        # Build Main QSplitter (Left Sidebar + Right Viewport Area)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+
+        # Right Container (Canvas + Timeline)
+        right_container = QWidget(self.main_splitter)
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(4)
+
         vp_frame = QFrame()
         vp_frame.setFrameStyle(QFrame.Shape.NoFrame)
         vp_frame.setStyleSheet(
-            "QFrame { border: 2px solid #1e293b; border-radius: 6px; "
-            "background: transparent; }"
+            "QFrame { border: 1px solid #30363d; border-radius: 6px; "
+            "background: #0d1117; }"
         )
         vp_layout = QVBoxLayout(vp_frame)
         vp_layout.setContentsMargins(0, 0, 0, 0)
-        vp_layout.addWidget(self.viewport)
-        self.setCentralWidget(vp_frame)
+        vp_layout.setSpacing(0)
+        self.tool_strip = ToolStrip()
+        self.tool_strip.setStyleSheet(
+            "QFrame#toolStrip { background: #161b22; "
+            "border-bottom: 1px solid #30363d; "
+            "border-top-left-radius: 6px; border-top-right-radius: 6px; }"
+        )
+        self.tool_strip.tool_selected.connect(self._set_draw_mode)
+        vp_layout.addWidget(self.tool_strip)
+        vp_layout.addWidget(self.viewport, 1)
 
+        # --- Timeline Scrubbing Bar ---
+        timeline_bar = QHBoxLayout()
+        timeline_bar.setContentsMargins(8, 4, 8, 4)
+        lbl_timeline = QLabel("Timeline:")
+        lbl_timeline.setStyleSheet("color: #8b949e; font-weight: 600; font-size: 11px;")
+        timeline_bar.addWidget(lbl_timeline)
+
+        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_slider.setRange(0, 0)
+        self.timeline_slider.setValue(0)
+        self.timeline_slider.setToolTip("Scrub simulation timeline back and forth")
+        self.timeline_slider.sliderPressed.connect(self._on_timeline_pressed)
+        self.timeline_slider.sliderMoved.connect(self._on_timeline_moved)
+        self.timeline_slider.sliderReleased.connect(self._on_timeline_released)
+        timeline_bar.addWidget(self.timeline_slider, 1)
+
+        self.timeline_label = QLabel("Step 0")
+        self.timeline_label.setStyleSheet(
+            "color: #58a6ff; font-family: 'JetBrains Mono', monospace; font-size: 11px;"
+        )
+        timeline_bar.addWidget(self.timeline_label)
+        vp_layout.addLayout(timeline_bar)
+
+        right_layout.addWidget(vp_frame, 1)
+
+        # Create panels before adding to left sidebar
         self.runtime_probes: list[Probe] = []
         self._rebuild_probes()
 
         self.scene_panel = ScenePanel(sim, self.scene)
         self.scene_panel.scene_changed.connect(self._on_scene_changed)
         self.scene_panel.parameters_changed.connect(self._on_params_changed)
-        self.scene_dock = QDockWidget("Scene", self)
-        self.scene_dock.setWidget(self.scene_panel)
-        self.scene_dock.setMinimumWidth(260)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.scene_dock)
 
         self.analysis_panel = AnalysisPanel(sim)
-        self.analysis_dock = QDockWidget("Analysis", self)
-        self.analysis_dock.setWidget(self.analysis_panel)
-        self.analysis_dock.setMinimumWidth(310)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.analysis_dock)
-
         self.outcome_panel = OutcomePanel(sim, self.scene)
-        self.outcome_dock = QDockWidget("What am I seeing?", self)
-        self.outcome_dock.setWidget(self.outcome_panel)
-        self.outcome_dock.setMinimumWidth(360)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.outcome_dock)
-        self.tabifyDockWidget(self.analysis_dock, self.outcome_dock)
-        self.outcome_dock.raise_()
+
+        # Left accordion sidebar
+        self.sidebar = Sidebar(self.main_splitter)
+        self.sidebar.setMinimumWidth(280)
+        self.sidebar.setMaximumWidth(400)
+        self.sidebar.add_section(
+            SidebarSection("scene", "SCENE", self.scene_panel, expanded=True)
+        )
+        self.sidebar.add_section(
+            SidebarSection(
+                "parameters",
+                "PARAMETERS",
+                self._build_parameters_widget(),
+                expanded=True,
+            )
+        )
+        self.sidebar.add_section(
+            SidebarSection(
+                "visualize",
+                "VISUALIZE",
+                self._build_visualize_widget(),
+                expanded=True,
+            )
+        )
+        self.sidebar.add_section(
+            SidebarSection("analysis", "ANALYSIS", self.analysis_panel, expanded=True)
+        )
+        self.sidebar.add_section(
+            SidebarSection("outcome", "OUTCOME", self.outcome_panel, expanded=True)
+        )
+
+        self.main_splitter.addWidget(self.sidebar)
+        self.main_splitter.addWidget(right_container)
+        self.main_splitter.setSizes([280, 1040])
+
+        self.setCentralWidget(self.main_splitter)
 
         self._sync_analysis_probes()
         self.analysis_panel.set_scene(self.scene)
+        self._setup_header_bar()
         self._setup_menus()
         self._setup_toolbar()
         self._setup_statusbar()
         self._setup_shortcuts()
-        self.set_expert_mode(False)
+        self.set_expert_mode(False)  # Default to Beginner mode
         self._show_welcome_if_first()
 
         self._auto_detect_view()
@@ -146,69 +223,113 @@ class MainWindow(QMainWindow):
         self.toolbar = QToolBar("Simulation")
         self.addToolBar(self.toolbar)
 
+        # --- Core simulation controls ---
         self.play_btn = QPushButton("Pause")
         self.play_btn.setFixedWidth(80)
+        self.play_btn.setToolTip(
+            "Pause or resume the simulation\n"
+            "Why: Control timing to observe specific flow events"
+        )
         self.play_btn.clicked.connect(self.toggle_pause)
         self.toolbar.addWidget(self.play_btn)
 
         step_btn = QPushButton("Step")
-        step_btn.setToolTip("Advance one frame")
+        step_btn.setToolTip(
+            "Advance one frame\nWhy: Slow down to see exactly how fluid moves"
+            " step-by-step"
+        )
         step_btn.clicked.connect(self.step_once)
         self.toolbar.addWidget(step_btn)
 
         reset_btn = QPushButton("Reset")
+        reset_btn.setToolTip(
+            "Clear simulation and restart from initial conditions\n"
+            "Why: Start fresh after changing parameters"
+        )
         reset_btn.clicked.connect(self.reset)
         self.toolbar.addWidget(reset_btn)
 
         self.toolbar.addSeparator()
 
+        # --- Scene management ---
         self.start_btn = QPushButton("Start…")
-        self.start_btn.setToolTip("Open templates, presets, and recipes")
+        self.start_btn.setToolTip(
+            "Open guided flow stories and presets\n"
+            "Why: Quick access to learning scenarios"
+        )
         self.start_btn.clicked.connect(self._open_wizard)
         self.toolbar.addWidget(self.start_btn)
 
         self.toolbar.addSeparator()
 
-        self.colormap_combo = QPushButton(self._colormap_label("speed"))
-        self.colormap_combo.setMenu(self._build_colormap_menu())
-        self.toolbar.addWidget(self.colormap_combo)
-
-        self.toolbar.addSeparator()
-
+        # --- Workflow tools ---
         self.demo_btn = QPushButton("Run Demo")
+        self.demo_btn.setToolTip(
+            "Auto-run preset to settled state\n"
+            "Why: See the final flow pattern without waiting"
+        )
         self.demo_btn.clicked.connect(self._run_guided_demo)
         self.toolbar.addWidget(self.demo_btn)
 
         self.presets_btn = QPushButton("Presets")
+        self.presets_btn.setToolTip(
+            "Load saved scene files\nWhy: Reuse or share your experiments"
+        )
         self.presets_btn.clicked.connect(self._open_preset_dialog)
         self.toolbar.addWidget(self.presets_btn)
 
         self.export_fig_btn = QPushButton("Export Figure")
+        self.export_fig_btn.setToolTip(
+            "Save high-res image or report\nWhy: Include in lab reports or"
+            " presentations"
+        )
         self.export_fig_btn.clicked.connect(self._quick_export_figure)
         self.toolbar.addWidget(self.export_fig_btn)
 
+        self.toolbar.addSeparator()
+
+        # --- Mode toggle ---
+        self.mode_btn = QPushButton("Beginner")
+        self.mode_btn.setCheckable(True)
+        self.mode_btn.setToolTip(
+            "Toggle Beginner/Expert mode\n"
+            "Why: Beginner hides advanced tools for learning"
+        )
+        self.mode_btn.clicked.connect(self._toggle_mode)
+        self.toolbar.addWidget(self.mode_btn)
+
+        self.toolbar.addSeparator()
+
+        # --- Advanced tools (hidden in Beginner mode) ---
         self.recipes_btn = QPushButton("Recipes")
+        self.recipes_btn.setToolTip(
+            "Guided workflow recipes\nWhy: Step-by-step instructions for common tasks"
+        )
         self.recipes_btn.clicked.connect(self._open_recipes_dialog)
         self.toolbar.addWidget(self.recipes_btn)
 
         self.sweep_re_btn = QPushButton("Sweep Re")
+        self.sweep_re_btn.setToolTip(
+            "Parameter sweep across Reynolds numbers\n"
+            "Why: See how flow changes with Re (generates plots)"
+        )
         self.sweep_re_btn.clicked.connect(self._open_sweep_dialog)
         self.toolbar.addWidget(self.sweep_re_btn)
 
         self.ai_btn = QPushButton("AI")
         self.ai_btn.setCheckable(True)
         self.ai_btn.setEnabled(False)
-        self.ai_btn.setToolTip("AI tutor — Coming soon")
+        self.ai_btn.setToolTip(
+            "AI tutor (coming soon)\nWhy: Get explanations and guidance"
+        )
         self.ai_btn.clicked.connect(self._toggle_ai_preview)
         self.toolbar.addWidget(self.ai_btn)
 
-        self.mode_btn = QPushButton("Beginner")
-        self.mode_btn.setCheckable(True)
-        self.mode_btn.clicked.connect(self._toggle_mode)
-        self.toolbar.addWidget(self.mode_btn)
-
         self.perf_btn = QPushButton("Perf")
         self.perf_btn.setCheckable(True)
+        self.perf_btn.setToolTip(
+            "Show performance metrics (FPS, MLUPs)\nWhy: Monitor simulation speed"
+        )
         self.perf_btn.clicked.connect(self._toggle_perf)
         self.toolbar.addWidget(self.perf_btn)
 
@@ -216,7 +337,10 @@ class MainWindow(QMainWindow):
         self.physics_combo.addItem("Standard", "standard")
         self.physics_combo.addItem("Liquid  [Experimental]", "liquid")
         self.physics_combo.addItem("Oil-water  [Experimental]", "oil-water")
-        self.physics_combo.setToolTip("Physics mode (recreates the simulation engine)")
+        self.physics_combo.setToolTip(
+            "Physics mode (recreates the simulation engine)\n"
+            "Why: Standard for single-phase, Liquid for multiphase"
+        )
         self.physics_combo.currentIndexChanged.connect(self._on_physics_mode_changed)
         self.physics_combo_label = QLabel("Physics:")
         self.toolbar.addWidget(self.physics_combo_label)
@@ -225,71 +349,60 @@ class MainWindow(QMainWindow):
         self.gpu_btn = QPushButton("GPU")
         self.gpu_btn.setCheckable(True)
         self.gpu_btn.setToolTip(
-            "Enable GPU acceleration (requires CuPy)\n" "Recreates engine on toggle"
+            "Enable GPU acceleration (requires CuPy)\n"
+            "Why: Faster simulation on larger grids"
         )
         self.gpu_btn.clicked.connect(self._toggle_gpu)
         self.toolbar.addWidget(self.gpu_btn)
 
-        self.toolbar.addSeparator()
-
         self.record_btn = QPushButton("Record")
         self.record_btn.setCheckable(True)
+        self.record_btn.setToolTip(
+            "Record video (MP4/GIF)\nWhy: Create animations for presentations"
+        )
         self.record_btn.clicked.connect(self._toggle_recording)
         self.toolbar.addWidget(self.record_btn)
 
-        self.toolbar.addSeparator()
+    def _setup_header_bar(self) -> None:
+        """Top Header Bar with live physics readouts."""
+        self.header_bar = QWidget()
+        self.header_bar.setFixedHeight(36)
+        self.header_bar.setStyleSheet(
+            "background: #161b22; border-bottom: 1px solid #30363d;"
+        )
+        layout = QHBoxLayout(self.header_bar)
+        layout.setContentsMargins(12, 0, 12, 0)
 
-        self._draw_group: list[QPushButton] = []
-        self._freehand_btn: QPushButton | None = None
-        for mode, label in [
-            ("circle", "Circle"),
-            ("rect", "Rect"),
-            ("polygon", "Polygon"),
-            ("probe", "Probe"),
-        ]:
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.clicked.connect(
-                lambda checked, m=mode, b=btn: self._set_draw_mode(m, b)
-            )
-            self.toolbar.addWidget(btn)
-            self._draw_group.append(btn)
-            if mode == "polygon":
-                self._freehand_btn = btn
+        title_lbl = QLabel("S-STREAM")
+        title_lbl.setStyleSheet(
+            "font-weight: 800; font-size: 13px; letter-spacing: 1px; color: #58a6ff;"
+        )
+        layout.addWidget(title_lbl)
 
-        select_btn = QPushButton("Select")
-        select_btn.setCheckable(True)
-        select_btn.setChecked(True)
-        select_btn.clicked.connect(lambda: self._set_draw_mode(None, select_btn))
-        self.toolbar.addWidget(select_btn)
-        self._draw_group.append(select_btn)
+        layout.addStretch(1)
 
-        self.toolbar.addSeparator()
+        self.re_header_lbl = QLabel("Re: -")
+        self.re_header_lbl.setStyleSheet(
+            "font-family: 'JetBrains Mono', monospace; font-size: 11px; "
+            "color: #3fb950; font-weight: 600;"
+        )
+        layout.addWidget(self.re_header_lbl)
 
-        self.arrows_btn = QPushButton("Arrows")
-        self.arrows_btn.setCheckable(True)
-        self.arrows_btn.clicked.connect(self._toggle_arrows)
-        self.toolbar.addWidget(self.arrows_btn)
+        layout.addSpacing(16)
 
-        self.streams_btn = QPushButton("Streams")
-        self.streams_btn.setCheckable(True)
-        self.streams_btn.clicked.connect(self._toggle_streams)
-        self.toolbar.addWidget(self.streams_btn)
+        self.fps_header_lbl = QLabel("FPS: -")
+        self.fps_header_lbl.setStyleSheet(
+            "font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #8b949e;"
+        )
+        layout.addWidget(self.fps_header_lbl)
 
-        self.contours_btn = QPushButton("Contours")
-        self.contours_btn.setCheckable(True)
-        self.contours_btn.clicked.connect(self._toggle_contours)
-        self.toolbar.addWidget(self.contours_btn)
+        layout.addSpacing(16)
 
-        self.force_btn = QPushButton("Force")
-        self.force_btn.setCheckable(True)
-        self.force_btn.clicked.connect(self._toggle_force_arrows)
-        self.toolbar.addWidget(self.force_btn)
-
-        self.particles_btn = QPushButton("Particles")
-        self.particles_btn.setCheckable(True)
-        self.particles_btn.clicked.connect(self._toggle_particles)
-        self.toolbar.addWidget(self.particles_btn)
+        self.step_header_lbl = QLabel("Step: 0")
+        self.step_header_lbl.setStyleSheet(
+            "font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #e6edf3;"
+        )
+        layout.addWidget(self.step_header_lbl)
 
     def _setup_statusbar(self) -> None:
         self.status = QStatusBar()
@@ -444,7 +557,7 @@ class MainWindow(QMainWindow):
         self.outcome_panel.set_demo_target(self._demo_target)
         self._update_title()
         self._update_re_label()
-        self.outcome_dock.raise_()
+        self._focus_outcome()
 
     def _configure_domain_for_scene(self) -> None:
         """Enable cavity lid when the Start template / scene name matches."""
@@ -474,14 +587,70 @@ class MainWindow(QMainWindow):
         length = characteristic_length(self.scene)
         re = reynolds_number(self.sim, length)
         self.re_label.setText(f"Re: {re:.1f}")
+        self._update_re_pill(re)
+
+    def _update_re_pill(self, re: float) -> None:
+        if not hasattr(self, "re_pill_label"):
+            return
+        if re < 500:
+            color = "#3fb950"
+        elif re < 10000:
+            color = "#d29922"
+        else:
+            color = "#f85149"
+        self.re_pill_label.setText(f"Re: {re:.1f}" if re > 0 else "Re: -")
+        self.re_pill_label.setStyleSheet(
+            f"QLabel {{ background: #21262d; color: {color}; "
+            f"border: 1px solid {color}; "
+            "border-radius: 9px; padding: 2px 10px; "
+            "font-family: 'JetBrains Mono', monospace; "
+            "font-size: 11px; font-weight: 600; }"
+        )
+
+    def _focus_outcome(self) -> None:
+        if hasattr(self, "sidebar") and hasattr(self.sidebar, "expand_section"):
+            self.sidebar.expand_section("outcome")
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
         self.play_btn.setText("Play" if self.paused else "Pause")
 
+    def _record_state_history(self) -> None:
+        if self._scrubbing:
+            return
+        f_copy = np.copy(getattr(self.sim, "f", self.sim.get_velocity_view()))
+        rho_copy = np.copy(getattr(self.sim, "rho", self.sim.get_pressure()))
+        self._state_history.append((self.step_count, f_copy, rho_copy))
+        if len(self._state_history) > self._max_history_steps:
+            self._state_history.pop(0)
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setRange(0, len(self._state_history) - 1)
+        self.timeline_slider.setValue(len(self._state_history) - 1)
+        self.timeline_slider.blockSignals(False)
+        self.timeline_label.setText(f"Step {self.step_count}")
+
+    def _on_timeline_pressed(self) -> None:
+        self._scrubbing = True
+        self.paused = True
+        self.play_btn.setText("Play")
+
+    def _on_timeline_moved(self, index: int) -> None:
+        if 0 <= index < len(self._state_history):
+            step, f_snap, rho_snap = self._state_history[index]
+            if hasattr(self.sim, "f"):
+                np.copyto(self.sim.f, f_snap)
+            if hasattr(self.sim, "rho"):
+                np.copyto(self.sim.rho, rho_snap)
+            self.timeline_label.setText(f"Step {step} (History)")
+            self.viewport.update()
+
+    def _on_timeline_released(self) -> None:
+        self._scrubbing = False
+
     def step_once(self) -> None:
         self.sim.step()
         self.step_count += 1
+        self._record_state_history()
         self.analysis_panel.tick(1.0)
         self.outcome_panel.update_outcome(self.step_count)
         self.viewport.update()
@@ -501,13 +670,17 @@ class MainWindow(QMainWindow):
         self._configure_domain_for_scene()
         apply_to_sim(self.scene, self.sim)
         self.step_count = 0
+        self._state_history.clear()
+        self.timeline_slider.setRange(0, 0)
+        self.timeline_label.setText("0 / 0")
         self.outcome_panel.update_outcome(self.step_count, force=True)
         self._update_re_label()
 
     def tick(self) -> None:
-        if not self.paused:
+        if not self.paused and not self._scrubbing:
             self.sim.step()
             self.step_count += 1
+            self._record_state_history()
             self.analysis_panel.tick(1.0)
             if self._demo_running and self._demo_target > 0:
                 if self.step_count >= self._demo_target:
@@ -528,9 +701,8 @@ class MainWindow(QMainWindow):
         self.timer.start(max(1, 33 - int(elapsed * 1000)))
         self._frame_start = time.perf_counter()
 
-    def _set_draw_mode(self, mode: str | None, sender: QPushButton) -> None:
-        for btn in self._draw_group:
-            btn.setChecked(btn is sender)
+    def _set_draw_mode(self, mode: str | None) -> None:
+        self.tool_strip.set_mode(mode)
         self.viewport.set_draw_mode(mode)
 
     def _on_viewport_obstacle(self, obs) -> None:
@@ -562,52 +734,94 @@ class MainWindow(QMainWindow):
     def _auto_detect_view(self) -> None:
         name = type(self.sim).__name__
         if name == "LBM2DLiquid":
-            self.viewport.set_colormap("density")
-            self.colormap_combo.setText(self._colormap_label("density"))
+            self._set_colormap("density")
         elif name == "LBM2DMultiComponent":
-            self.viewport.set_colormap("component1")
-            self.colormap_combo.setText(self._colormap_label("component1"))
+            self._set_colormap("component1")
 
-    @staticmethod
-    def _colormap_label(name: str) -> str:
+    def _build_parameters_widget(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        pill_row = QHBoxLayout()
+        self.re_pill_label = QLabel("Re: -")
+        self.re_pill_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pill_row.addWidget(self.re_pill_label)
+        pill_row.addStretch(1)
+        layout.addLayout(pill_row)
+
+        layout.addWidget(self.scene_panel.parameter_group)
+        layout.addStretch(1)
+        self._update_re_pill(0.0)
+        return widget
+
+    def _build_visualize_widget(self) -> QWidget:
         from resources.colormaps import FIELD_REGISTRY
 
-        info = FIELD_REGISTRY.get(name)
-        label = info.label if info else name.capitalize()
-        return f"View: {label}"
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
-    def _build_colormap_menu(self):
-        from resources.colormaps import FIELD_REGISTRY
-
-        menu = QMenu(self)
+        field_row = QHBoxLayout()
+        field_lbl = QLabel("Field")
+        field_lbl.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: 600;")
+        field_row.addWidget(field_lbl)
+        self.field_combo = QComboBox()
         for name in _COLORMAPS:
             info = FIELD_REGISTRY.get(name)
             label = info.label if info else name.capitalize()
-            action = menu.addAction(label)
-            action.triggered.connect(lambda checked, n=name: self._set_colormap(n))
-        return menu
+            self.field_combo.addItem(label, name)
+        self.field_combo.currentIndexChanged.connect(self._on_field_changed)
+        field_row.addWidget(self.field_combo, 1)
+        layout.addLayout(field_row)
 
-    def _toggle_arrows(self, checked: bool) -> None:
-        self.viewport.set_show_quiver(checked)
+        self._vis_checkboxes: list[tuple[QCheckBox, str]] = []
+        for key, text in (
+            ("streamlines", "Streamlines"),
+            ("quiver", "Velocity arrows"),
+            ("contours", "Pressure contours"),
+            ("force", "Force arrows"),
+            ("particles", "Particles"),
+            ("hud", "Physics HUD"),
+        ):
+            cb = QCheckBox(text)
+            cb.setChecked(key == "hud")
+            cb.stateChanged.connect(lambda state, k=key: self._on_vis_toggle(k, state))
+            layout.addWidget(cb)
+            self._vis_checkboxes.append((cb, key))
+        layout.addStretch(1)
+        return widget
 
-    def _toggle_streams(self, checked: bool) -> None:
-        self.viewport.set_show_streamlines(checked)
+    def _on_field_changed(self, index: int) -> None:
+        name = self.field_combo.itemData(index)
+        if name:
+            self._set_colormap(name)
 
-    def _toggle_contours(self, checked: bool) -> None:
-        self.viewport.set_show_contours(checked)
-
-    def _toggle_force_arrows(self, checked: bool) -> None:
-        self.viewport.set_show_force_arrows(checked)
-
-    def _toggle_particles(self, checked: bool) -> None:
-        self.viewport.set_show_particles(checked)
+    def _on_vis_toggle(self, key: str, state: int) -> None:
+        checked = bool(state)
+        setters = {
+            "streamlines": self.viewport.set_show_streamlines,
+            "quiver": self.viewport.set_show_quiver,
+            "contours": self.viewport.set_show_contours,
+            "force": self.viewport.set_show_force_arrows,
+            "particles": self.viewport.set_show_particles,
+            "hud": self.viewport.set_show_hud,
+        }
+        setters[key](checked)
 
     def _set_colormap(self, name: str) -> None:
         if name not in _COLORMAPS:
             name = _COLORMAPS[0]
         self.viewport.set_colormap(name)
         self.analysis_panel.set_colormap(name)
-        self.colormap_combo.setText(self._colormap_label(name))
+        if hasattr(self, "field_combo"):
+            idx = self.field_combo.findData(name)
+            if idx >= 0:
+                self.field_combo.blockSignals(True)
+                self.field_combo.setCurrentIndex(idx)
+                self.field_combo.blockSignals(False)
 
     def _show_welcome_if_first(self) -> None:
         from PySide6.QtCore import QSettings
@@ -625,10 +839,28 @@ class MainWindow(QMainWindow):
         self._active_dialog = dialog
         dialog.open()
 
+    def _prompt_poe_prediction(self, scene_name: str) -> None:
+        poe_msg = QMessageBox(self)
+        poe_msg.setWindowTitle(f"Predict-Observe-Explain — {scene_name}")
+        poe_msg.setIcon(QMessageBox.Icon.Question)
+        poe_msg.setText(
+            f"<b>Predict-Observe-Explain (POE)</b><br><br>"
+            f"Before starting <i>{scene_name}</i>, what flow behavior "
+            f"do you predict will form downstream?"
+        )
+        poe_msg.setInformativeText(
+            "Formulating a mental hypothesis before running significantly "
+            "enhances spatial physics understanding."
+        )
+        poe_msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        poe_msg.setDefaultButton(QMessageBox.StandardButton.Ok)
+        poe_msg.exec()
+
     def _on_wizard_template(self, template: WizardTemplate) -> None:
         self.scene = template.scene
         self._file_path = None
         self._apply_and_refresh()
+        self._prompt_poe_prediction(template.name)
         if self.scene.product.autorun_steps:
             self._run_guided_demo()
         if template.tips:
@@ -646,6 +878,7 @@ class MainWindow(QMainWindow):
             self.scene = load_preset(path)
             self._file_path = None
             self._apply_and_refresh()
+            self._prompt_poe_prediction(self.scene.name)
             if self.scene.product.autorun_steps:
                 self._run_guided_demo()
         except Exception as e:
@@ -661,11 +894,11 @@ class MainWindow(QMainWindow):
         self.demo_btn.setText("Running...")
         self.outcome_panel.set_demo_target(target)
         self._set_colormap(self.scene.product.recommended_colormap or "vorticity")
-        self.outcome_dock.raise_()
+        self._focus_outcome()
 
     def _toggle_ai_preview(self, checked: bool) -> None:
         self.ai_btn.setChecked(False)
-        self.outcome_dock.raise_()
+        self._focus_outcome()
         self.outcome_panel.refresh_ai_preview(has_api_key=False)
         self.status.showMessage("AI tutor — Coming soon", 4000)
 
@@ -673,7 +906,8 @@ class MainWindow(QMainWindow):
         self.set_expert_mode(checked)
 
     def set_expert_mode(self, expert: bool) -> None:
-        """Beginner shows: Play/Step/Reset, Start, View, Circle/Rect/Probe/Select."""
+        """Beginner shows: Play/Step/Reset, Start, View, Demo/Presets/Export,
+        Mode, Drawing tools, Visualization tools."""
         self._expert_mode = expert
         self.mode_btn.blockSignals(True)
         self.mode_btn.setChecked(expert)
@@ -681,46 +915,33 @@ class MainWindow(QMainWindow):
         self.mode_btn.blockSignals(False)
         self.scene_panel.set_expert_mode(expert)
 
+        # Advanced tools hidden in Beginner mode
         for w in (
-            self.demo_btn,
-            self.presets_btn,
-            self.export_fig_btn,
             self.recipes_btn,
             self.sweep_re_btn,
             self.ai_btn,
             self.perf_btn,
             self.gpu_btn,
-            self.record_btn,
             self.physics_combo_label,
             self.physics_combo,
-            self.arrows_btn,
-            self.streams_btn,
-            self.contours_btn,
-            self.force_btn,
-            self.particles_btn,
+            self.record_btn,
         ):
             w.setVisible(expert)
-        if self._freehand_btn is not None:
-            self._freehand_btn.setVisible(expert)
+        self.tool_strip.set_polygon_visible(expert)
         if hasattr(self, "recipes_action"):
             self.recipes_action.setVisible(expert)
         if hasattr(self, "sweep_action"):
             self.sweep_action.setVisible(expert)
 
         if not expert:
-            for btn, setter in (
-                (self.arrows_btn, self.viewport.set_show_quiver),
-                (self.streams_btn, self.viewport.set_show_streamlines),
-                (self.contours_btn, self.viewport.set_show_contours),
-                (self.force_btn, self.viewport.set_show_force_arrows),
-                (self.particles_btn, self.viewport.set_show_particles),
-            ):
-                btn.setChecked(False)
-                setter(False)
+            for cb, key in self._vis_checkboxes:
+                if key != "hud":
+                    cb.setChecked(False)
+                    self._on_vis_toggle(key, 0)
             self.perf_btn.setChecked(False)
             self.viewport.set_perf_mode(False)
             if self.viewport.draw_mode == "polygon":
-                self._set_draw_mode(None, self._draw_group[-1])
+                self._set_draw_mode(None)
 
     def _sync_physics_mode_combo(self) -> None:
         name = type(self.sim).__name__

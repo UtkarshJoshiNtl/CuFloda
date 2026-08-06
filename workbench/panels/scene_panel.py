@@ -117,12 +117,17 @@ class ScenePanel(QWidget):
         self._current_editor: _PropEditor | None = None
         self._current_item: QTreeWidgetItem | None = None
         self._expert_mode = False
+        self._undo_stack: list[str] = []
+        self._redo_stack: list[str] = []
+        self._max_history = 20
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # --- Simulation parameters ---
-        self._build_parameter_group(layout)
+        # --- Simulation parameters (moved to the Parameters sidebar section) ---
+        self.parameter_group: QGroupBox = self._build_parameter_group()
+        self._build_particle_group(layout)
+        self._build_engine_specific_group(layout)
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabel("Scene Objects")
@@ -159,11 +164,24 @@ class ScenePanel(QWidget):
         self.remove_btn = QPushButton("Remove")
         self.remove_btn.clicked.connect(self._remove_selected)
         btn_row.addWidget(self.remove_btn)
+
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.setToolTip("Undo last scene edit\nWhy: Recover from mistakes")
+        self.undo_btn.clicked.connect(self._undo)
+        btn_row.addWidget(self.undo_btn)
+
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.setEnabled(False)
+        self.redo_btn.setToolTip("Redo undone edit\nWhy: Restore if you undid too far")
+        self.redo_btn.clicked.connect(self._redo)
+        btn_row.addWidget(self.redo_btn)
+
         layout.addLayout(btn_row)
 
         self._rebuild_tree()
 
-    def _build_parameter_group(self, layout: QVBoxLayout) -> None:
+    def _build_parameter_group(self) -> QGroupBox:
         group = QGroupBox("Simulation Parameters")
         form = QFormLayout()
         form.setContentsMargins(4, 4, 4, 4)
@@ -177,8 +195,9 @@ class ScenePanel(QWidget):
         self._param_visc.setToolTip(
             "Kinematic viscosity (nu). Controls fluid thickness.\n"
             "Lower = thinner fluid, higher Reynolds number.\n"
-            "Typical: water ~0.001, air ~0.0001\n"
-            "Range: 0.0005 (nearly inviscid) to 0.1 (very viscous)"
+            "Range: 0.0005 (inviscid risk) to 0.1 (very viscous)\n"
+            "Safety: Green = Stable (nu > 0.005), Yellow = High Re, "
+            "Red = Divergence risk (nu < 0.001)"
         )
         form.addRow("Viscosity", self._param_visc)
 
@@ -225,10 +244,11 @@ class ScenePanel(QWidget):
         self._param_u_inflow.setToolTip(
             "Inflow velocity (lattice units). Drives the flow from left to right.\n"
             "Re = u_inflow * characteristic_length / viscosity.\n"
-            "Higher values produce faster, more turbulent flow.\n"
-            "Range: 0.0 (static) to 0.5 (max stable)"
+            "Safety: Green = Stable (u < 0.15), Yellow = Moderate (0.15-0.3), "
+            "Red = Divergence risk (u > 0.35)"
         )
         form.addRow("Inflow", self._param_u_inflow)
+        self._update_parameter_safety_styles()
 
         self._param_diff = QDoubleSpinBox()
         self._param_diff.setRange(0.0, 0.5)
@@ -262,10 +282,8 @@ class ScenePanel(QWidget):
         form.addRow("Smoke Decay", self._param_decay)
 
         group.setLayout(form)
-        layout.addWidget(group)
 
-        self._build_particle_group(layout)
-        self._build_engine_specific_group(layout)
+        return group
 
     def _build_particle_group(self, layout: QVBoxLayout) -> None:
         group = QGroupBox("Particles")
@@ -658,14 +676,51 @@ class ScenePanel(QWidget):
         self.sim.g_adhesion = val
         self.parameters_changed.emit()
 
+    def _update_parameter_safety_styles(self) -> None:
+        nu = self._param_visc.value()
+        u = self._param_u_inflow.value()
+
+        red = (
+            "QDoubleSpinBox { background-color: #451a1a; color: #fca5a5; "
+            "border: 1px solid #ef4444; }"
+        )
+        yellow = (
+            "QDoubleSpinBox { background-color: #422006; color: #fde047; "
+            "border: 1px solid #eab308; }"
+        )
+        green = (
+            "QDoubleSpinBox { background-color: #064e3b; color: #6ee7b7; "
+            "border: 1px solid #10b981; }"
+        )
+
+        # Viscosity styling
+        if nu < 0.001:
+            visc_style = red
+        elif nu < 0.005:
+            visc_style = yellow
+        else:
+            visc_style = green
+        self._param_visc.setStyleSheet(visc_style)
+
+        # Inflow styling
+        if u > 0.35:
+            inflow_style = red
+        elif u > 0.18:
+            inflow_style = yellow
+        else:
+            inflow_style = green
+        self._param_u_inflow.setStyleSheet(inflow_style)
+
     def _on_param_visc(self, val: float) -> None:
         self.scene.viscosity = val
         self.sim.viscosity = val
+        self._update_parameter_safety_styles()
         self.parameters_changed.emit()
 
     def _on_param_u_inflow(self, val: float) -> None:
         self.scene.u_inflow = val
         self.sim.u_inflow = val
+        self._update_parameter_safety_styles()
         self.parameters_changed.emit()
 
     def _on_param_diff(self, val: float) -> None:
@@ -954,6 +1009,7 @@ class ScenePanel(QWidget):
         self._props_placeholder.show()
 
     def _on_prop_changed(self) -> None:
+        self._save_state()
         self._refresh_current_label()
         self._reapply()
         self.scene_changed.emit()
@@ -970,6 +1026,7 @@ class ScenePanel(QWidget):
         self._current_item.setText(0, self._item_label(obj))
 
     def _add_obstacle(self, kind: str) -> None:
+        self._save_state()
         obs = copy.deepcopy(_OBSTACLE_DEFAULTS[kind])
         self.scene.obstacles.append(obs)
         self._reapply()
@@ -984,6 +1041,7 @@ class ScenePanel(QWidget):
         )
         if not path:
             return
+        self._save_state()
         obs = STLObstacle(
             name=Path(path).stem,
             path=path,
@@ -1007,6 +1065,7 @@ class ScenePanel(QWidget):
         )
         if not path:
             return
+        self._save_state()
         obs = ImageObstacle(
             name=Path(path).stem,
             path=path,
@@ -1019,6 +1078,7 @@ class ScenePanel(QWidget):
         self.scene_changed.emit()
 
     def _add_emitter(self) -> None:
+        self._save_state()
         emit = EmitterSpec(
             name="Emitter",
             x=self.scene.width // 2,
@@ -1030,9 +1090,11 @@ class ScenePanel(QWidget):
         self.scene_changed.emit()
 
     def _add_probe(self) -> None:
+        self._save_state()
         cx, cy = self.scene.width // 2, self.scene.height // 2
         probe = ProbeSpec(name="Probe", x=cx, y=cy)
         self.scene.probes.append(probe)
+        self._reapply()
         self._rebuild_tree()
         self.scene_changed.emit()
 
@@ -1047,6 +1109,7 @@ class ScenePanel(QWidget):
         cat_name = _CATEGORY_KEY[cat_idx]
         lst = getattr(self.scene, cat_name)
         if 0 <= item_idx < len(lst):
+            self._save_state()
             del lst[item_idx]
         self._clear_props()
         self._reapply()
@@ -1054,6 +1117,7 @@ class ScenePanel(QWidget):
         self.scene_changed.emit()
 
     def add_obstacle_from_viewport(self, obs: ObstacleSpec) -> None:
+        self._save_state()
         self.scene.obstacles.append(obs)
         self._reapply()
         self._rebuild_tree()
@@ -1065,3 +1129,48 @@ class ScenePanel(QWidget):
     def refresh(self) -> None:
         self._rebuild_tree()
         self._reapply()
+
+    def _save_state(self) -> None:
+        import json
+
+        from scene.serializer import scene_to_dict
+
+        snap = json.dumps(scene_to_dict(self.scene))
+        self._undo_stack.append(snap)
+        if len(self._undo_stack) > self._max_history:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self.undo_btn.setEnabled(True)
+        self.redo_btn.setEnabled(False)
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            return
+        import json
+
+        from scene.serializer import dict_to_scene, scene_to_dict
+
+        current_snap = json.dumps(scene_to_dict(self.scene))
+        self._redo_stack.append(current_snap)
+        prev_snap = self._undo_stack.pop()
+        self.scene = dict_to_scene(json.loads(prev_snap))
+        self.undo_btn.setEnabled(len(self._undo_stack) > 0)
+        self.redo_btn.setEnabled(True)
+        self.refresh()
+        self.scene_changed.emit()
+
+    def _redo(self) -> None:
+        if not self._redo_stack:
+            return
+        import json
+
+        from scene.serializer import dict_to_scene, scene_to_dict
+
+        current_snap = json.dumps(scene_to_dict(self.scene))
+        self._undo_stack.append(current_snap)
+        next_snap = self._redo_stack.pop()
+        self.scene = dict_to_scene(json.loads(next_snap))
+        self.undo_btn.setEnabled(True)
+        self.redo_btn.setEnabled(len(self._redo_stack) > 0)
+        self.refresh()
+        self.scene_changed.emit()

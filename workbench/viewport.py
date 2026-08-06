@@ -53,10 +53,18 @@ from OpenGL.GL import (  # noqa: E402
     glUniform1i,
     glUseProgram,
     glVertexAttribPointer,
+    glViewport,
 )
 from OpenGL.GL.shaders import compileProgram, compileShader  # noqa: E402
-from PySide6.QtCore import QPointF, Qt, Signal  # noqa: E402
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen  # noqa: E402
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal  # noqa: E402
+from PySide6.QtGui import (  # noqa: E402
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPen,
+)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget  # noqa: E402
 
 from engines.base import SimEngine  # noqa: E402
@@ -125,6 +133,7 @@ class Viewport(QOpenGLWidget):
         self._show_contours = False
         self._show_force_arrows = False
         self._show_particles = False
+        self._show_hud = True
         self._slice_axis = 0  # 0=z midplane for 3D
         self._slice_index: int | None = None
         self.draw_mode: str | None = None
@@ -138,8 +147,13 @@ class Viewport(QOpenGLWidget):
         self._particle_cache: tuple | None = None
         self._colorbar_pixmap = None
         self._colorbar_cmap: str | None = None
+        self._hover_pos: tuple[float, float] | None = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_show_hud(self, show: bool) -> None:
+        self._show_hud = show
+        self.update()
 
     def set_sim(self, sim: SimEngine) -> None:
         self.sim = sim
@@ -155,7 +169,9 @@ class Viewport(QOpenGLWidget):
 
     def set_colormap(self, name: str) -> None:
         self._colormap = name
-        self._upload_colormap()
+        self._cmap_uploaded = None
+        if self._cmap_tex is not None:
+            self._upload_colormap()
 
     def set_perf_mode(self, enabled: bool) -> None:
         if enabled != self._perf_mode:
@@ -212,22 +228,35 @@ class Viewport(QOpenGLWidget):
 
     # --- coordinate helpers ---
 
+    def _canvas_rect(self) -> QRectF:
+        """Letterboxed canvas rect preserving the grid's intrinsic aspect ratio."""
+        if self.scene is None or self.scene.width <= 0 or self.scene.height <= 0:
+            return QRectF(0, 0, self.width(), self.height())
+        w = self.width()
+        h = self.height()
+        scale = min(w / self.scene.width, h / self.scene.height)
+        cw = self.scene.width * scale
+        ch = self.scene.height * scale
+        return QRectF((w - cw) / 2, (h - ch) / 2, cw, ch)
+
     def _widget_to_grid(self, wx: float, wy: float) -> tuple[float, float]:
         if self.scene is None:
             return (0.0, 0.0)
-        w = self.width()
-        h = self.height()
-        gx = wx / w * self.scene.width
-        gy = wy / h * self.scene.height
+        r = self._canvas_rect()
+        if r.width() <= 0 or r.height() <= 0:
+            return (0.0, 0.0)
+        gx = (wx - r.x()) / r.width() * self.scene.width
+        gy = (wy - r.y()) / r.height() * self.scene.height
+        gx = min(max(gx, 0.0), float(self.scene.width))
+        gy = min(max(gy, 0.0), float(self.scene.height))
         return (gx, gy)
 
     def _grid_to_widget(self, gx: float, gy: float) -> tuple[float, float]:
         if self.scene is None:
             return (0.0, 0.0)
-        w = self.width()
-        h = self.height()
-        wx = gx / self.scene.width * w
-        wy = gy / self.scene.height * h
+        r = self._canvas_rect()
+        wx = r.x() + gx / self.scene.width * r.width()
+        wy = r.y() + gy / self.scene.height * r.height()
         return (wx, wy)
 
     # --- OpenGL init / paint ---
@@ -290,8 +319,17 @@ class Viewport(QOpenGLWidget):
         if self.sim is None:
             return
         self._overlay_frame += 1
-        glClearColor(0.08, 0.08, 0.14, 1.0)
+        glClearColor(0.051, 0.067, 0.09, 1.0)
         glClear(GL_COLOR_BUFFER_BIT)
+
+        dpr = self.devicePixelRatioF()
+        rect = self._canvas_rect()
+        glViewport(
+            int(rect.x() * dpr),
+            int(rect.y() * dpr),
+            int(rect.width() * dpr),
+            int(rect.height() * dpr),
+        )
 
         self._upload_smoke()
         glUseProgram(self.shader)
@@ -306,6 +344,13 @@ class Viewport(QOpenGLWidget):
         glDrawArrays(GL_TRIANGLES, 0, 6)
         glBindVertexArray(0)
         glUseProgram(0)
+
+        glViewport(
+            0,
+            0,
+            int(self.width() * dpr),
+            int(self.height() * dpr),
+        )
 
         vel = self._get_vel()
         obs = self.sim.get_obstacles()
@@ -373,10 +418,7 @@ class Viewport(QOpenGLWidget):
             painter.setPen(pen)
             painter.setBrush(QColor(0, 220, 220, 60))
             s = (
-                min(
-                    self.width() / self.scene.width,
-                    self.height() / self.scene.height,
-                )
+                self._canvas_rect().width() / self.scene.width
                 if self.scene.width > 0 and self.scene.height > 0
                 else 1
             )
@@ -401,6 +443,9 @@ class Viewport(QOpenGLWidget):
         if self._show_particles:
             self._draw_particles(painter)
 
+        if self._show_hud:
+            self._draw_hud_overlay(painter)
+
         if self._drag_start is not None and self._drag_end is not None:
             pen = QPen(QColor(255, 255, 255, 200), 2)
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -410,14 +455,7 @@ class Viewport(QOpenGLWidget):
             ex, ey = self._grid_to_widget(*self._drag_end)
             if self.draw_mode == "circle":
                 r_grid = math.dist(self._drag_start, self._drag_end)
-                s = (
-                    min(
-                        self.width() / self.scene.width,
-                        self.height() / self.scene.height,
-                    )
-                    if self.scene
-                    else 1
-                )
+                s = self._canvas_rect().width() / self.scene.width if self.scene else 1
                 r = r_grid * s
                 painter.drawEllipse(int(sx - r), int(sy - r), int(r * 2), int(r * 2))
             elif self.draw_mode == "rect":
@@ -449,6 +487,7 @@ class Viewport(QOpenGLWidget):
                 painter.setPen(dash_pen)
                 painter.drawLine(int(last[0]), int(last[1]), int(cx), int(cy))
 
+        self._draw_hover_inspector(painter)
         self._draw_colorbar(painter)
 
         if (
@@ -457,24 +496,24 @@ class Viewport(QOpenGLWidget):
             and len(self.scene.obstacles) == 0
         ):
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(15, 23, 42, 200))
+            painter.setBrush(QColor(15, 23, 42, 220))
             painter.drawRoundedRect(self.rect().adjusted(40, 40, -40, -40), 12, 12)
             painter.setPen(QColor(56, 189, 248))
             font = painter.font()
-            font.setPointSize(22)
+            font.setPointSize(28)
             font.setBold(True)
             painter.setFont(font)
             painter.drawText(
-                self.rect().adjusted(0, 0, 0, -40),
+                self.rect().adjusted(0, -40, 0, -80),
                 Qt.AlignmentFlag.AlignCenter,
                 "S-Stream",
             )
-            font.setPointSize(13)
+            font.setPointSize(14)
             font.setBold(False)
             painter.setFont(font)
-            painter.setPen(QColor(148, 163, 184))
+            painter.setPen(QColor(203, 213, 225))
             painter.drawText(
-                self.rect().adjusted(60, 40, -60, -60),
+                self.rect().adjusted(80, 20, -80, -40),
                 Qt.AlignmentFlag.AlignCenter,
                 "Click Presets to start a guided flow story,\n"
                 "or draw an obstacle to see the flow adapt.",
@@ -485,7 +524,7 @@ class Viewport(QOpenGLWidget):
     def _draw_obstacle_shape(self, painter: QPainter, obs: ObstacleSpec) -> None:
         s = 1
         if self.scene and self.scene.width > 0 and self.scene.height > 0:
-            s = min(self.width() / self.scene.width, self.height() / self.scene.height)
+            s = self._canvas_rect().width() / self.scene.width
         label_font = QFont("monospace", 10)
         label_font.setBold(True)
         if isinstance(obs, CircleObstacle):
@@ -567,8 +606,9 @@ class Viewport(QOpenGLWidget):
     ) -> None:
         h, w = vel.shape[:2]
         spacing = max(2, min(h, w) // 16)
-        sw = self.width() / w
-        sh = self.height() / h
+        cr = self._canvas_rect()
+        sw = cr.width() / w
+        sh = cr.height() / h
         u_inflow = getattr(self.sim, "u_inflow", 0.15)
         max_speed = max(u_inflow * 1.5, 0.001)
 
@@ -586,8 +626,8 @@ class Viewport(QOpenGLWidget):
                 speed = math.sqrt(u * u + v * v)
                 if speed < 0.001:
                     continue
-                cx = x * sw
-                cy = y * sh
+                cx = cr.x() + x * sw
+                cy = cr.y() + y * sh
                 length = (speed / max_speed) * spacing * sw * 0.75
                 angle = math.atan2(v, u)
                 dx = math.cos(angle) * length
@@ -611,8 +651,9 @@ class Viewport(QOpenGLWidget):
         self, painter: QPainter, vel: np.ndarray, obs: np.ndarray | None = None
     ) -> None:
         h, w = vel.shape[:2]
-        sw = self.width() / w
-        sh = self.height() / h
+        cr = self._canvas_rect()
+        sw = cr.width() / w
+        sh = cr.height() / h
 
         if self._overlay_frame % 6 != 0 and self._streamline_cache is not None:
             pen = QPen(QColor(255, 255, 255, 55), 1)
@@ -672,8 +713,8 @@ class Viewport(QOpenGLWidget):
             safe_speed = np.where(cur_alive, speed, 1.0)
             for i_local in range(len(idx_alive)):
                 i_global = idx_alive[i_local]
-                px = int(xs[i_global] * sw)
-                py = int(ys[i_global] * sh)
+                px = int(cr.x() + xs[i_global] * sw)
+                py = int(cr.y() + ys[i_global] * sh)
                 all_pts[i_global].append((px, py))
 
             xs[alive] += (u_interp[cur_alive] / safe_speed[cur_alive]) * step_size
@@ -692,17 +733,18 @@ class Viewport(QOpenGLWidget):
         if self._overlay_frame % 6 != 0 and self._contour_cache is not None:
             pen = QPen(QColor(255, 255, 255, 60), 1)
             painter.setPen(pen)
-            lines, sw, sh = self._contour_cache
+            lines, sw, sh, ox, oy = self._contour_cache
             for ex1, ey1, ex2, ey2 in lines:
-                x1, y1 = int(ex1 * sw), int(ey1 * sh)
-                x2, y2 = int(ex2 * sw), int(ey2 * sh)
+                x1, y1 = int(ox + ex1 * sw), int(oy + ey1 * sh)
+                x2, y2 = int(ox + ex2 * sw), int(oy + ey2 * sh)
                 painter.drawLine(x1, y1, x2, y2)
             return
 
         p = self.sim.get_pressure()
         h, w = p.shape
-        sw = self.width() / w
-        sh = self.height() / h
+        cr = self._canvas_rect()
+        sw = cr.width() / w
+        sh = cr.height() / h
         mx = max(float(np.percentile(np.abs(p), 95)), 0.001)
         levels = np.linspace(-mx, mx, 11)
         all_lines = []
@@ -728,11 +770,16 @@ class Viewport(QOpenGLWidget):
                 cell_idx = int(idx[cy, cx])
                 edges = self._ms_edges(cell_idx, level, tl_v, tr_v, br_v, bl_v, x2, y2)
                 all_lines.extend(edges)
-        self._contour_cache = (all_lines, sw, sh)
+        self._contour_cache = (all_lines, sw, sh, cr.x(), cr.y())
         pen = QPen(QColor(255, 255, 255, 60), 1)
         painter.setPen(pen)
         for ex1, ey1, ex2, ey2 in all_lines:
-            painter.drawLine(int(ex1 * sw), int(ey1 * sh), int(ex2 * sw), int(ey2 * sh))
+            painter.drawLine(
+                int(cr.x() + ex1 * sw),
+                int(cr.y() + ey1 * sh),
+                int(cr.x() + ex2 * sw),
+                int(cr.y() + ey2 * sh),
+            )
 
     def _marching_squares_contour(
         self,
@@ -816,8 +863,9 @@ class Viewport(QOpenGLWidget):
         if not self.scene or not self.scene.obstacles:
             return
         h, w = vel.shape[:2]
-        sw = self.width() / w
-        sh = self.height() / h
+        cr = self._canvas_rect()
+        sw = cr.width() / w
+        sh = cr.height() / h
         if obs is None:
             obs = self.sim.get_obstacles()
         u_inflow = getattr(self.sim, "u_inflow", 0.15)
@@ -832,9 +880,9 @@ class Viewport(QOpenGLWidget):
             magnitude = math.sqrt(force_x**2 + force_y**2)
             if magnitude < 1e-6:
                 continue
-            px = (cx + cw / 2) * sw
-            py = (cy + ch / 2) * sh
-            max_arrow = min(self.width(), self.height()) * 0.1
+            px = cr.x() + (cx + cw / 2) * sw
+            py = cr.y() + (cy + ch / 2) * sh
+            max_arrow = min(cr.width(), cr.height()) * 0.1
             scale = min(max_arrow / max(magnitude, 1e-6), 10.0)
             dx = force_x * scale
             dy = force_y * scale
@@ -921,8 +969,11 @@ class Viewport(QOpenGLWidget):
                 else (self.sim.grid_shape[-1], self.sim.grid_shape[-2])
             ),
         )
-        sw = self.width() / w
-        sh = self.height() / h
+        cr = self._canvas_rect()
+        sw = cr.width() / w
+        sh = cr.height() / h
+        ox = cr.x()
+        oy = cr.y()
 
         if self._overlay_frame % 4 != 0 and self._particle_cache is not None:
             trail_lines, dot_positions = self._particle_cache
@@ -954,10 +1005,10 @@ class Viewport(QOpenGLWidget):
                 t_start = max(0, int(t_min * (trail_len - 1)))
                 t_end = min(trail_len - 1, int(t_max * (trail_len - 1)))
                 for t in range(t_start, t_end):
-                    px_list = trails[t, :, 0] * sw
-                    py_list = trails[t, :, 1] * sh
-                    px_list_next = trails[t + 1, :, 0] * sw
-                    py_list_next = trails[t + 1, :, 1] * sh
+                    px_list = ox + trails[t, :, 0] * sw
+                    py_list = oy + trails[t, :, 1] * sh
+                    px_list_next = ox + trails[t + 1, :, 0] * sw
+                    py_list_next = oy + trails[t + 1, :, 1] * sh
                     for i in range(n):
                         x0, y0 = float(px_list[i]), float(py_list[i])
                         x1, y1 = float(px_list_next[i]), float(py_list_next[i])
@@ -971,12 +1022,102 @@ class Viewport(QOpenGLWidget):
         painter.setBrush(QColor(255, 255, 255, 220))
         dot_r = max(2, min(4, int(min(sw, sh) * 0.3)))
         for i in range(len(positions)):
-            px = positions[i, 0] * sw
-            py = positions[i, 1] * sh
+            px = ox + positions[i, 0] * sw
+            py = oy + positions[i, 1] * sh
             dot_positions.append((px, py))
             painter.drawEllipse(int(px - dot_r), int(py - dot_r), dot_r * 2, dot_r * 2)
 
         self._particle_cache = (trail_lines, dot_positions)
+
+    # --- hud overlay ---
+
+    def _draw_hud_overlay(self, painter: QPainter) -> None:
+        if not self.sim or not self.scene:
+            return
+        from analysis.physics import characteristic_length, reynolds_number
+        from analysis.regimes import detect_flow_regime
+
+        length = characteristic_length(self.scene)
+        re = reynolds_number(self.sim, length)
+        regime_obj = detect_flow_regime(self.sim, self.scene, self.probes)
+        regime = regime_obj.label
+
+        # Get max velocity
+        vel = self.sim.get_velocity_view()
+        max_v = (
+            float(np.max(np.hypot(vel[..., 0], vel[..., 1])))
+            if vel is not None
+            else 0.0
+        )
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(15, 23, 42, 185))
+        hud_rect = self.rect().adjusted(
+            16, 16, -self.width() + 210, -self.height() + 105
+        )
+        if hud_rect.width() > 50 and hud_rect.height() > 40:
+            painter.drawRoundedRect(hud_rect, 8, 8)
+            painter.setPen(QPen(QColor(56, 189, 248, 220), 1))
+            font = QFont("sans-serif", 9, QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.drawText(
+                hud_rect.adjusted(10, 8, -10, -10),
+                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+                "LIVE PHYSICS HUD",
+            )
+            font.setBold(False)
+            painter.setFont(font)
+            painter.setPen(QColor(226, 232, 240))
+            metrics_text = (
+                f"Re: {re:.1f}\nRegime: {regime}\nMax Vel: {max_v:.3f} lattice"
+            )
+            painter.drawText(
+                hud_rect.adjusted(10, 26, -10, -8),
+                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+                metrics_text,
+            )
+
+    # --- hover inspector ---
+
+    def _draw_hover_inspector(self, painter: QPainter) -> None:
+        if self._hover_pos is None or self.sim is None or self.scene is None:
+            return
+        if self._drag_start is not None or self._drag_end is not None:
+            return
+        gx, gy = self._hover_pos
+        ix, iy = int(round(gx)), int(round(gy))
+        if not (0 <= ix < self.scene.width and 0 <= iy < self.scene.height):
+            return
+        wx, wy = self._grid_to_widget(gx, gy)
+        vel = self.sim.get_velocity_view()
+        if vel is not None and vel.ndim == 3:
+            speed = float(np.hypot(vel[iy, ix, 0], vel[iy, ix, 1]))
+        else:
+            speed = 0.0
+        rho_text = "rho —"
+        try:
+            rho = float(self.sim.get_density()[iy, ix])
+            rho_text = f"rho {rho:.4f}"
+        except Exception:
+            pass
+        lines = [f"({ix}, {iy})", f"|u| {speed:.4f}", rho_text]
+        fm = QFontMetrics(painter.font())
+        card_w = max(fm.horizontalAdvance(ln) for ln in lines) + 24
+        card_h = len(lines) * (fm.height() + 3) + 14
+        px = int(wx) + 14
+        py = int(wy) - card_h - 8
+        px = max(4, min(px, int(self.width()) - card_w - 4))
+        py = max(4, py)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(13, 17, 23, 235))
+        painter.drawRoundedRect(px, py, card_w, card_h, 6, 6)
+        painter.setPen(QPen(QColor(88, 166, 255, 200), 1))
+        painter.drawRoundedRect(px, py, card_w, card_h, 6, 6)
+        painter.setPen(QColor(230, 237, 243))
+        ty = py + fm.height()
+        for ln in lines:
+            painter.drawText(px + 12, ty, ln)
+            ty += fm.height() + 3
 
     # --- colorbar ---
 
@@ -985,10 +1126,11 @@ class Viewport(QOpenGLWidget):
 
         from resources.colormaps import FIELD_REGISTRY
 
+        cr = self._canvas_rect()
         bar_w = 18
-        bar_h = min(180, self.height() - 40)
-        bx = self.width() - bar_w - 20
-        by = 24
+        bar_h = max(40, min(180, int(cr.height()) - 40))
+        bx = int(cr.right()) - bar_w - 20
+        by = int(cr.top()) + 24
 
         cmap_name = MODE_TO_CMAP.get(self._colormap, "viridis")
         if self._colorbar_cmap != cmap_name or self._colorbar_pixmap is None:
@@ -1073,10 +1215,17 @@ class Viewport(QOpenGLWidget):
         super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        if self.draw_mode is None or self.scene is None:
+        if self.scene is None:
             super().mouseMoveEvent(event)
             return
-        gx, gy = self._widget_to_grid(event.position().x(), event.position().y())
+        wx, wy = event.position().x(), event.position().y()
+        gx, gy = self._widget_to_grid(wx, wy)
+        inside = self._canvas_rect().contains(wx, wy)
+        self._hover_pos = (gx, gy) if inside else None
+        if self.draw_mode is None:
+            self.update()
+            super().mouseMoveEvent(event)
+            return
         if self.draw_mode == "polygon":
             if self._poly_points:
                 self._cursor_pos = (gx, gy)
