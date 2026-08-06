@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -196,7 +196,6 @@ class MainWindow(QMainWindow):
 
         self._sync_analysis_probes()
         self.analysis_panel.set_scene(self.scene)
-        self._setup_header_bar()
         self._setup_menus()
         self._setup_toolbar()
         self._setup_statusbar()
@@ -335,52 +334,14 @@ class MainWindow(QMainWindow):
         self.record_btn.clicked.connect(self._toggle_recording)
         self.toolbar.addWidget(self.record_btn)
 
-    def _setup_header_bar(self) -> None:
-        """Top Header Bar with live physics readouts."""
-        self.header_bar = QWidget()
-        self.header_bar.setFixedHeight(36)
-        self.header_bar.setStyleSheet(
-            "background: #161b22; border-bottom: 1px solid #30363d;"
-        )
-        layout = QHBoxLayout(self.header_bar)
-        layout.setContentsMargins(12, 0, 12, 0)
-
-        title_lbl = QLabel("S-STREAM")
-        title_lbl.setStyleSheet(
-            "font-weight: 800; font-size: 13px; letter-spacing: 1px; color: #58a6ff;"
-        )
-        layout.addWidget(title_lbl)
-
-        layout.addStretch(1)
-
-        self.re_header_lbl = QLabel("Re: -")
-        self.re_header_lbl.setStyleSheet(
-            "font-family: 'JetBrains Mono', monospace; font-size: 11px; "
-            "color: #3fb950; font-weight: 600;"
-        )
-        layout.addWidget(self.re_header_lbl)
-
-        layout.addSpacing(16)
-
-        self.fps_header_lbl = QLabel("FPS: -")
-        self.fps_header_lbl.setStyleSheet(
-            "font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #8b949e;"
-        )
-        layout.addWidget(self.fps_header_lbl)
-
-        layout.addSpacing(16)
-
-        self.step_header_lbl = QLabel("Step: 0")
-        self.step_header_lbl.setStyleSheet(
-            "font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #e6edf3;"
-        )
-        layout.addWidget(self.step_header_lbl)
-
     def _setup_statusbar(self) -> None:
         self.status = QStatusBar()
         self.re_label = QLabel("Re: -")
         self.status.addWidget(self.re_label)
-        hints = QLabel("Space: Play/Pause  |  R: Reset  |  Esc: Cancel draw")
+        hints = QLabel(
+            "Space: Play/Pause | .: Step | J/K/L: Speed | 1-5: Tools | "
+            "V: Field | S: Streams | Esc: Cancel"
+        )
         hints.setStyleSheet("color: #64748b;")
         self.status.addWidget(hints)
         self.status_label = QLabel("Step 0  |  FPS: -")
@@ -405,10 +366,43 @@ class MainWindow(QMainWindow):
         quit_shortcut.triggered.connect(self.close)
         self.addAction(quit_shortcut)
 
+        # Viewport-focused shortcuts (only fire while the canvas has focus,
+        # so typing in sidebar spinboxes/comboes is never intercepted).
+        vp = self.viewport
+        viewport_map = {
+            Qt.Key_Period: self.step_once,
+            Qt.Key_K: self.toggle_pause,
+            Qt.Key_J: lambda: self._shift_speed(-1),
+            Qt.Key_L: lambda: self._shift_speed(+1),
+            Qt.Key_V: self._cycle_field,
+            Qt.Key_S: lambda: self._on_vis_toggle(
+                "streamlines", 0 if vp._show_streamlines else 2
+            ),
+            Qt.Key_1: lambda: self._set_draw_mode("select"),
+            Qt.Key_2: lambda: self._set_draw_mode("circle"),
+            Qt.Key_3: lambda: self._set_draw_mode("rect"),
+            Qt.Key_4: lambda: self._set_draw_mode("polygon"),
+            Qt.Key_5: lambda: self._set_draw_mode("probe"),
+        }
+        for key, handler in viewport_map.items():
+            sc = QShortcut(QKeySequence(key), vp)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(handler)
+
+    def _shift_speed(self, delta: int) -> None:
+        combo = self.transport_bar.speed_combo
+        idx = combo.currentIndex()
+        idx = max(0, min(combo.count() - 1, idx + delta))
+        combo.setCurrentIndex(idx)
+
+    def _cycle_field(self) -> None:
+        idx = self.field_combo.currentIndex()
+        self.field_combo.setCurrentIndex((idx + 1) % self.field_combo.count())
+
     def _setup_menus(self) -> None:
         menu = self.menuBar()
-        file_menu = menu.addMenu("&File")
 
+        file_menu = menu.addMenu("&File")
         new_action = QAction("&New", self)
         new_action.setShortcut(QKeySequence.StandardKey.New)
         new_action.triggered.connect(self._file_new)
@@ -431,30 +425,10 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        open_preset_action = QAction("Open &Preset...", self)
-        open_preset_action.triggered.connect(self._open_preset_dialog)
-        file_menu.addAction(open_preset_action)
-
-        wizard_action = QAction("&Start...", self)
-        wizard_action.setShortcut(QKeySequence("Ctrl+W"))
-        wizard_action.triggered.connect(self._open_wizard)
-        file_menu.addAction(wizard_action)
-
-        self.recipes_action = QAction("&Recipes...", self)
-        self.recipes_action.triggered.connect(self._open_recipes_dialog)
-        file_menu.addAction(self.recipes_action)
-
-        file_menu.addSeparator()
-
         export_action = QAction("&Export...", self)
         export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.triggered.connect(self._open_export_dialog)
         file_menu.addAction(export_action)
-
-        self.sweep_action = QAction("&Sweep...", self)
-        self.sweep_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        self.sweep_action.triggered.connect(self._open_sweep_dialog)
-        file_menu.addAction(self.sweep_action)
 
         file_menu.addSeparator()
 
@@ -462,6 +436,25 @@ class MainWindow(QMainWindow):
         quit_action.setShortcut(QKeySequence("Ctrl+Q"))
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
+
+        tools_menu = menu.addMenu("&Tools")
+        wizard_action = QAction("&Start...", self)
+        wizard_action.setShortcut(QKeySequence("Ctrl+W"))
+        wizard_action.triggered.connect(self._open_wizard)
+        tools_menu.addAction(wizard_action)
+
+        open_preset_action = QAction("Open &Preset...", self)
+        open_preset_action.triggered.connect(self._open_preset_dialog)
+        tools_menu.addAction(open_preset_action)
+
+        self.recipes_action = QAction("&Recipes...", self)
+        self.recipes_action.triggered.connect(self._open_recipes_dialog)
+        tools_menu.addAction(self.recipes_action)
+
+        self.sweep_action = QAction("&Sweep...", self)
+        self.sweep_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.sweep_action.triggered.connect(self._open_sweep_dialog)
+        tools_menu.addAction(self.sweep_action)
 
     def _file_new(self) -> None:
         self.scene = default_scene()
